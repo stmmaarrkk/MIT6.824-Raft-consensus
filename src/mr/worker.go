@@ -1,10 +1,13 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +16,13 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type TaskResult int
+
+const (
+	TaskSuccess TaskResult = 0
+	TaskFail    TaskResult = 1
+)
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,47 +34,79 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+type worker struct {
+	id          int
+	terminating bool
+	mapf        func(string, string) []KeyValue
+	reducef     func(string, []string) string
+}
 
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	// Your worker implementation here.
+	w := worker{
+		mapf:        mapf,
+		reducef:     reducef,
+		terminating: false,
+	}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
+	w.register()
+	w.run()
+}
+func (w *worker) run() {
+	log.Printf("Worker %v start running", w.id)
+	for !w.terminating {
+		t := w.askForTask()
+		if t.Stat != TaskExecuting {
+			log.Printf("This is not a valid task!")
+			break
+		}
+		w.doTask(t)
+	}
+	log.Printf("Worker %v terminating....", w.id)
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+/*communications*/
+//called for registering worker to the coordinator
+func (w *worker) register() {
+	args := &RegArgs{}
+	reply := &RegReply{}
+	if ok := call("Coordinator.RegisterWorker", &args, &reply); !ok {
+		log.Fatal("Fail to register!")
 	}
+	w.id = reply.WorkerId
+	log.Printf("Worker %v registered", w.id)
+}
+
+func (w *worker) askForTask() Task {
+	DPrintf("[w.askForTask]: ask for a new task")
+	args := &TaskReqArgs{WorkerId: w.id}
+	reply := &TaskReqReply{}
+	if ok := call("Coordinator.AssignTask", &args, &reply); !ok {
+		log.Fatal("Fail to get a job!")
+		os.Exit(1)
+	}
+	log.Printf("Get task %v", reply.NewTask.TaskId)
+	return *reply.NewTask
+}
+
+//get called when task is finished or run into error
+func (w *worker) reportTask(t Task, result TaskResult, err error) {
+	args := TaskReportArgs{
+		Complete: true,
+		WorkerId: w.id,
+		TaskId:   t.TaskId,
+	}
+	reply := TaskReportReply{}
+
+	if result != TaskSuccess {
+		log.Printf("%v", err)
+		args.Complete = false
+	}
+	log.Printf("Report task %v, success? %v", t.TaskId, args.Complete)
+	call("Coordinator.ReportTask", &args, &reply)
 }
 
 //
@@ -88,4 +130,57 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+/*do functions*/
+func (w *worker) doTask(t Task) {
+	switch t.Stage {
+	case StageMap:
+		w.doMapTask(t)
+	case StageRed:
+		w.doRedTask(t)
+	case StageFinishing:
+		w.doFinishingTask(t)
+	default:
+		log.Fatalf("Something goes wrong, the stage should be either Map or reduce, but now is %v", t.Stage)
+	}
+}
+
+func (w *worker) doMapTask(t Task) {
+	DPrintf("[w.doMapTask] start to do map task")
+
+	contents, err := ioutil.ReadFile(t.FileSrc)
+	if err != nil {
+		w.reportTask(t, TaskFail, err)
+		return
+	}
+
+	kvs := w.mapf(t.FileSrc, string(contents))
+
+	//groupify kv to its hash index
+	intMedArr := make([][]KeyValue, t.NReduce)
+	for _, kv := range kvs {
+		hashIdx := ihash(kv.Key) % t.NReduce
+		intMedArr[hashIdx] = append(intMedArr[hashIdx], kv)
+	}
+
+	//save grouped kvs to the certain file
+	for hashKey := 0; hashKey < t.NReduce; hashKey++ {
+		intMedFilename := combineName(t.TaskId, hashKey)
+		if err := saveKVsToFile(intMedArr[hashKey], intMedFilename); err != nil {
+			w.reportTask(t, TaskFail, err)
+			return
+		}
+	}
+
+	w.reportTask(t, TaskSuccess, nil)
+}
+
+func (w *worker) doRedTask(t Task) {
+	w.reportTask(t, TaskSuccess, nil)
+}
+
+func (w *worker) doFinishingTask(t Task) {
+	w.terminating = true
+	w.reportTask(t, TaskSuccess, nil)
 }
