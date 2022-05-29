@@ -67,7 +67,7 @@ func (c *Coordinator) ReportTask(args *TaskReportArgs, reply *TaskReportReply) e
 		c.tasks[args.TaskId].Stat = TaskComplete
 		c.taskCompCount++
 		log.Printf("Task %v success! (%v/%v tasks completed)", args.TaskId, c.taskCompCount, len(c.tasks))
-	} else {
+	} else { //tasks is invalid
 		c.tasks[args.TaskId].Stat = TaskTerminated
 		log.Printf("Worker %v fail to complete task %v", args.WorkerId, args.TaskId)
 	}
@@ -114,24 +114,27 @@ func (c *Coordinator) initMapTask(taskId int) {
 		FileSrc:  c.files[taskId],
 		Stage:    c.stage,
 		NReduce:  c.nReduce,
+		NMap:     c.nFiles,
 	}
 }
 
 /* For reduce stage */
 func (c *Coordinator) initRedStage() {
+	DPrintf("[c.initRedStage]")
 	c.stage = StageRed
 	c.prepareRedTasks()
 	log.Printf("Switch to Reduce Stage")
 }
 
 func (c *Coordinator) prepareRedTasks() {
+	DPrintf("[c.prepareRedTasks]")
 	c.tasks = make([]Task, c.nReduce)
 	c.taskQueue = make(chan int, c.nReduce)
 	c.taskCompCount = 0
-	// for i := range files {
-	// 	c.initMapTask(i)
-	// }
-	// log.Printf("%v map tasks are created", len(c.tasks))
+	for i := 0; i < c.nReduce; i++ {
+		c.initRedTask(i)
+	}
+	log.Printf("%v reduce tasks are created", len(c.tasks))
 }
 
 func (c *Coordinator) initRedTask(taskId int) {
@@ -140,9 +143,10 @@ func (c *Coordinator) initRedTask(taskId int) {
 		WorkerId: -1,
 		TaskId:   taskId,
 		Stat:     TaskReady,
-		FileSrc:  c.files[taskId],
+		FileSrc:  "n/a",
 		Stage:    c.stage,
 		NReduce:  c.nReduce,
+		NMap:     c.nFiles,
 	}
 }
 
@@ -172,6 +176,7 @@ func (c *Coordinator) initFinishingTask(workerId int) {
 		FileSrc:  "",
 		Stage:    c.stage,
 		NReduce:  c.nReduce,
+		NMap:     c.nFiles,
 	}
 }
 
@@ -184,6 +189,7 @@ func (c *Coordinator) initiate(nReduce int, files []string) {
 }
 
 func (c *Coordinator) run() {
+	DInit()
 	for !c.Done() {
 		go c.scheduleTasks(true)
 		time.Sleep(SchedulePeriod)
@@ -206,16 +212,16 @@ func (c *Coordinator) scheduleTasks(needLock bool) {
 		case TaskReady:
 			c.addToQueue(taskId)
 		case TaskExecuting:
-			if time.Now().Sub(c.tasks[taskId].ValidThr) > 0 {
+			if time.Since(c.tasks[taskId].ValidThr) > 0 {
 				c.initTask(taskId)
 				DPrintf("Task %v has been reset due to expiration", taskId)
 				c.addToQueue(taskId) //must add it back to the queue immediately or deadlock takes place at the last task(since one more cycle is needed to add it back)
 			}
-		case TaskComplete:
 		case TaskTerminated:
 			c.initTask(taskId)
 			DPrintf("Task %v has been reset due to fail execution", taskId)
 			c.addToQueue(taskId)
+		case TaskComplete:
 		default:
 		}
 
@@ -226,8 +232,8 @@ func (c *Coordinator) initTask(taskId int) {
 	switch c.stage {
 	case StageMap:
 		c.initMapTask(taskId)
-		// case StageRed:
-		// 	c.initRedTask(taskId)
+	case StageRed:
+		c.initRedTask(taskId)
 	}
 }
 
@@ -264,20 +270,6 @@ func (c *Coordinator) Done() bool {
 	return d
 }
 
-//
-// create a Coordinator.
-// main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
-//
-func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	log.Printf("Debug mode:%v", Debug)
-	c := Coordinator{stage: StageInit}
-	c.initiate(nReduce, files)
-	go c.run()
-	c.server()
-	return &c
-}
-
 /*helper*/
 func (c *Coordinator) validateReport(args *TaskReportArgs) bool {
 	task := c.tasks[args.TaskId]
@@ -304,7 +296,8 @@ func (c *Coordinator) toNextStageIfNecessary() {
 		c.initMapStage()
 	case StageMap:
 		if c.nFiles == c.taskCompCount {
-			c.initFinishingStage() //modify this
+			DPrintf("[c.toNextStageIfNecessary]: to reduce stage")
+			c.initRedStage()
 		}
 	case StageRed:
 		if c.nReduce == c.taskCompCount {
@@ -318,4 +311,18 @@ func (c *Coordinator) toNextStageIfNecessary() {
 	default:
 		return
 	}
+}
+
+//
+// create a Coordinator.
+// main/mrcoordinator.go calls this function.
+// nReduce is the number of reduce tasks to use.
+//
+func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	log.Printf("Debug mode:%v", Debug)
+	c := Coordinator{stage: StageInit}
+	c.initiate(nReduce, files)
+	go c.run()
+	c.server()
+	return &c
 }

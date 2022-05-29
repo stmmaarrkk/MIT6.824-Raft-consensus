@@ -142,7 +142,7 @@ func (w *worker) doTask(t Task) {
 	case StageFinishing:
 		w.doFinishingTask(t)
 	default:
-		log.Fatalf("Something goes wrong, the stage should be either Map or reduce, but now is %v", t.Stage)
+		log.Fatalf("Something goes wrong, the stage should be either Map, reduce or finishing, but now is %v", t.Stage)
 	}
 }
 
@@ -177,6 +177,37 @@ func (w *worker) doMapTask(t Task) {
 }
 
 func (w *worker) doRedTask(t Task) {
+	kvMap := make(map[string][]string)
+
+	//load file with a certain hash index(taskId)
+	for mapIdx := 0; mapIdx < t.NMap; mapIdx++ {
+		intMedFilename := combineName(mapIdx, t.TaskId)
+		if err := readKVsFromFile(intMedFilename, kvMap); err != nil {
+			w.reportTask(t, TaskFail, err)
+			return
+		}
+	}
+	DPrintf("[w.doRedTask]: There are %v keys in kvMap", len(kvMap))
+
+	//get the final result by calling reduce function
+	results := make([]string, 0, 100)
+	for k, v := range kvMap {
+		results = append(results, fmt.Sprintf("%v %v", k, w.reducef(k, v)))
+	}
+	DPrintf("[w.doRedTask]: There are %v results", len(kvMap))
+
+	//print it to file
+	file, err := os.Create(fmt.Sprintf("mr-out-%v", t.TaskId))
+	if err != nil {
+		w.reportTask(t, TaskFail, err)
+		return
+	}
+
+	for _, result := range results {
+		fmt.Fprintln(file, result)
+	}
+	file.Close()
+
 	w.reportTask(t, TaskSuccess, nil)
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -35,17 +36,28 @@ type Task struct {
 	WorkerId int
 	TaskId   int
 	Stat     TaskStat
-	FileSrc  string
+	FileSrc  string //used in map stage only
 	Stage    ExecStage
 	ValidThr time.Time
 	NReduce  int //relevant to hash function of the key, equals to nReduce
+	NMap     int //number of files in the map stage
 }
 
 const Debug = false
 
-// func DInit(){
-// 	for
-// }
+func DInit() {
+	if Debug {
+		files, err := filepath.Glob("mr-*")
+		if err != nil {
+			panic(err)
+		}
+		for _, f := range files {
+			if err := os.Remove(f); err != nil {
+				panic(err)
+			}
+		}
+	}
+}
 func DPrintf(format string, v ...interface{}) {
 	if Debug {
 		log.Printf(format+"\n", v...)
@@ -53,31 +65,33 @@ func DPrintf(format string, v ...interface{}) {
 }
 
 func combineName(taskId int, hashKey int) string {
-	return fmt.Sprintf("mr-%v-%v", taskId, hashKey)
+	return fmt.Sprintf("mr-%v-%v.json", taskId, hashKey)
 }
 
-// func readKVsFromFile(fileSrc string) ([]KeyValue, error) {
-// 	var kvs []KeyValue
+//modify the kvMap inplace
+func readKVsFromFile(fileSrc string, kvMap map[string][]string) error {
+	file, err := os.Open(fileSrc)
+	if err != nil {
+		return err
+	}
 
-// 	file, err := os.Open(fileSrc)
-// 	if err != nil {
-// 		return kvs, err
-// 	}
-// 	defer file.Close()
+	dec := json.NewDecoder(file)
+	for {
+		var kv KeyValue
+		if err := dec.Decode(&kv); err != nil {
+			//break when eof happens
+			break
+		}
 
-// 	scanner := bufio.NewScanner(file)
-// 	// optionally, resize scanner's capacity for lines over 64K, see next example
-// 	for scanner.Scan() {
-// 		kv := strings.Split(scanner.Text(), " ")
-// 		kvs = append(kvs, KeyValue{kv[0], kv[1]})
-// 	}
+		//initiate this key
+		if _, ok := kvMap[kv.Key]; !ok {
+			kvMap[kv.Key] = make([]string, 0, 100)
+		}
+		kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
+	}
 
-// 	if err := scanner.Err(); err != nil {
-// 		return kvs, err
-// 	}
-
-// 	return kvs, nil
-// }
+	return nil
+}
 
 func saveKVsToFile(kvs []KeyValue, filename string) error {
 	file, err := os.Create(filename)
