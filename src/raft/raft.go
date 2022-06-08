@@ -19,27 +19,30 @@ package raft
 
 import (
 	//	"bytes"
+	"fmt"
+	"log"
+	"math/rand"
 	"sync"
 	"sync/atomic"
-
-	//	"6.824/labgob"
-	"6.824/labrpc"
-
-	"fmt"
 	"time"
+
+	"6.824/labrpc"
 )
 
-type PeerState int
+type PeerStatus int
 
 const (
-	Leader    PeerState = 0 //just prepared, but is not yet in queue
-	Candidate PeerState = 1
-	Follower  PeerState = 2 //stay in the queue, but is not yet selected
+	Leader    PeerStatus = 0 //just prepared, but is not yet in queue
+	Candidate PeerStatus = 1
+	Follower  PeerStatus = 2 //stay in the queue, but is not yet selected
 )
 
 const AppendEntriesInterval = 100
-const ElectionTimeoutLB = 2 * AppendEntriesInterval
-const ElectionTimeoutUB = 3 * AppendEntriesInterval
+const NonHeartbeatAEInterval = 3 //one non-heartbeat AppendEntries req will be sent once each NonHeartbeatAEFreq heart beat entries.
+const ElectionTimeoutLB = 3 * AppendEntriesInterval
+const ElectionTimeoutUB = 4 * AppendEntriesInterval
+const CommandBufferCap = 100
+const StatePersistPeriod = 100 //period(in ms) of saving state to disk
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -64,6 +67,22 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+//apply all commands that are committed
+func (rf *Raft) applyCommands() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for rf.lastApplied < rf.commitIndex {
+		rf.lastApplied++
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log.at(rf.lastApplied).Command,
+			CommandIndex: rf.lastApplied,
+		}
+		rf.applyCh <- msg
+		log.Printf("Command(%v) has been committed by peer %v", msg.CommandIndex, rf.me)
+	}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -73,6 +92,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -84,16 +104,21 @@ type Raft struct {
 	log         Log //temporary type
 
 	/*volatile states on all servers*/
-	state        PeerState
-	stateLock    sync.Mutex
+	status       PeerStatus
+	stateLock    sync.Mutex //lock for persistent state
+	commitIndex  int
+	lastApplied  int
 	tickerPeriod time.Duration
 	nPeer        int
 	termLeader   int
 	isolated     bool //true by default, will be set to false if receive hearbeat msg
 
 	/*volatile states on leader*/
-	snapshotOffset int
-	commitIdx      int
+	nextIndex      []int
+	matchIndex     []int
+	aERound        int
+	aEVerification int
+	cmdBuf         chan interface{}
 
 	/*for debug*/
 	timeoutCount int
@@ -103,7 +128,9 @@ func (rf *Raft) init() {
 	rf.setCurrentTerm(0)
 	rf.setVotedFor(-1)
 	rf.log = makeLog(nil)
-
+	rf.cmdBuf = make(chan interface{}, CommandBufferCap)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.timeoutCount = 0 //for debug
 }
 
@@ -115,7 +142,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	term = rf.currentTerm
-	isleader = rf.state == Leader
+	isleader = rf.status == Leader
 	return term, isleader
 }
 
@@ -134,17 +161,36 @@ func (rf *Raft) setVotedFor(votedFor int) bool {
 	return true //return false if there is an error
 }
 
-func (rf *Raft) appendLog(logs []Entry) bool {
-	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
-	return rf.log.append(logs)
-}
-
-func (rf *Raft) setLog(start int, end int, logs []Entry) bool {
+//set 1 entry, using logical index
+func (rf *Raft) setLog(idx int, log Entry) bool {
 	rf.stateLock.Lock()
 	defer rf.stateLock.Unlock()
 	//remember to save to disk
-	return true //return false if there is an error
+	rf.DPrintf("rf.setLog", "insert log to position %v ", idx)
+	rf.log.set(idx, log)
+
+	return true //return true if there is no error, for future use
+}
+
+//set entries, using logical index
+func (rf *Raft) setLogs(start int, logs []Entry) bool {
+	rf.stateLock.Lock()
+	defer rf.stateLock.Unlock()
+	//remember to save to disk
+	rf.DPrintf("rf.setLogs", "insert log with length of %v to position %v ", len(logs), start)
+	rf.log.setEntries(start, logs)
+
+	return true //return true if there is no error, for future use
+}
+
+//append 1 entry, using logical index
+func (rf *Raft) appendLog(log Entry) bool {
+	return rf.setLog(rf.log.nextIdx(), log) //return true if there is no error, for future use
+}
+
+//append entries, using logical index
+func (rf *Raft) appendLogs(logs []Entry) bool {
+	return rf.setLogs(rf.log.nextIdx(), logs) //return true if there is no error, for future use
 }
 
 //
@@ -170,7 +216,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	//code for 2A only(delete when proceed to 2B or 2C)
 
 	// Your code here (2C).
 	// Example:
@@ -215,54 +260,54 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  int
 	Entries      []Entry
 	LeaderCommit int
+	Verification int //used for checking if the AE reply is expired
 }
 type AppendEntriesReply struct {
 	Id      int
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 func (rf *Raft) sendAppendEntries() {
+	rf.aERound++
+
+	//send non heartbeat entries
+	if rf.aERound%NonHeartbeatAEInterval == 0 {
+		rf.aEVerification = rand.Intn(10000000) //update verification each NonHeartbeatAEInterval time
+		rf.DPrintf("rf.sendAppendEntries", "%v command to add", len(rf.cmdBuf))
+		for len(rf.cmdBuf) > 0 {
+			rf.appendLog(rf.createLog(<-rf.cmdBuf))
+		}
+		rf.matchIndex[rf.me] = rf.log.latestIdx()
+	}
+
 	receiverList := rf.getAllPeers()
-	var wg sync.WaitGroup
-	successReplies := make(chan AppendEntriesReply, rf.nPeer)
-	rf.DPrintf("rf.sendAppendEntries", "is ready for sending AE")
+	rf.updateCommitIndex()
+	// rf.DPrintf("rf.sendAppendEntries", "is ready for sending AE")
 	for r := range receiverList {
 		if r != rf.me {
-			wg.Add(1)
-			go func(wg *sync.WaitGroup, peerId int) {
-				defer wg.Done()
-				args := AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.termLeader,
-					PrevLogIndex: 1,
-					PrevLogTerm:  1,                       //need to be changed
-					Entries:      rf.log.getEntries(0, 1), //need to be changed
-					LeaderCommit: 0,                       //need to be changed
-
-				}
+			go func(peerId int) {
+				args := rf.generateAE(peerId) //will generate heartbeat AE automatically
 				reply := AppendEntriesReply{}
-				rf.DPrintf("AE", "before sending")
-				if !rf.peers[peerId].Call("Raft.AppendEntries", &args, &reply) {
-					rf.DPrintf("rf.sendAppendEntries", "fail to send AE to %v due to lost of connection", peerId)
-				} else if !reply.Success {
-					rf.DPrintf("rf.sendAppendEntries", "AE request denied by server %v", peerId)
+
+				//check if the request has been successfully sent
+				if rf.peers[peerId].Call("Raft.AppendEntries", &args, &reply) {
+					rf.handleAEReply(peerId, &args, &reply) //handle the reply
 				} else {
-					successReplies <- reply
-					rf.DPrintf("rf.sendAppendEntries", "AE request approved by server %v", peerId)
+					rf.DPrintf("rf.sendAppendEntries", "fail to send AE to %v due to lost of connection", peerId)
 				}
-				rf.DPrintf("AE", "aftersending")
-			}(&wg, r)
+			}(r)
 		}
 	}
-	wg.Wait()
-	rf.DPrintf("rf.sendAppendEntries", "%v of %v AE requests are approved", len(successReplies), rf.nPeer-1)
+	// rf.DPrintf("rf.sendAppendEntries", "%v of %v AE requests are approved", len(successReplies), rf.nPeer-1)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.DPrintf("rf.AppendEntries", "In term %v received a AE request from %v of term %v", rf.currentTerm, args.LeaderId, args.Term)
+	rf.DPrintf("rf.AppendEntries", "An AE request comes from server %v of term %v", args.LeaderId, args.Term)
 
 	//if the AE is in a valid term, this peer is not consider isolated
 	if args.Term >= rf.currentTerm {
@@ -270,16 +315,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.termLeader = args.LeaderId
 	}
 
-	if rf.verifyAEReq(args) {
-		if rf.state != Follower {
-			rf.DPrintf("rf.AppendEntries", "In term %v change state to follower due to new leader %v", rf.currentTerm, args.LeaderId)
+	reply.Id = rf.me
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+	if rf.verifyAEReq(args, reply) { //will generate the reply if fail to verify this AE req
+		if rf.status != Follower {
+			rf.DPrintf("rf.AppendEntries", "In term %v change status to follower due to new leader %v", rf.currentTerm, args.LeaderId)
 			rf.toFollower(nil)
 		}
-		reply.Id = rf.me
-		reply.Success = true
-		reply.Term = rf.currentTerm
 		rf.currentTerm = args.Term
+		rf.commitIndex = args.LeaderCommit
+
+		//clear the buffer
+		for len(rf.cmdBuf) > 0 {
+			<-rf.cmdBuf
+		}
+		reply.Success = rf.setLogs(args.PrevLogIndex+1, args.Entries)
+		rf.DPrintf("rf.AppendEntries", "%v entries are appended, %v entries in log", len(args.Entries), rf.log.size())
 	}
+	rf.mu.Unlock() //careful
+	rf.applyCommands()
+
 }
 
 //
@@ -426,12 +483,15 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := rf.commitIdx
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index := rf.log.latestIdx() + len(rf.cmdBuf) + 1
 	term := rf.currentTerm
-	isLeader := rf.state == Leader
-	DPrintf("[rf.Start] peer %v states: commitIdx:%v, term:%v, isLeader:%v", rf.me, index, term, isLeader)
+	isLeader := rf.status == Leader
 	// Your code here (2B).
-
+	// rf.DPrintf("rf.Start", "peer %v states: commitIdx:%v, term:%v, isLeader:%v", rf.me, index, term, isLeader)
+	rf.cmdBuf <- command
+	rf.DPrintf("rf.Start", "Received a command from client, got %v entry in buffer", len(rf.cmdBuf))
 	return index, term, isLeader
 }
 
@@ -468,7 +528,7 @@ func (rf *Raft) ticker() {
 		time.Sleep(rf.tickerPeriod)
 		rf.timeoutCount++
 		rf.DPrintf("rf.ticker", "ticker goes off(%v)", rf.timeoutCount)
-		switch rf.state {
+		switch rf.status {
 		case Leader:
 			go rf.sendAppendEntries() //may send heartbeat msg or real append entry req
 		case Candidate:
@@ -486,6 +546,14 @@ func (rf *Raft) ticker() {
 			}
 		}
 
+	}
+}
+
+//Implement logic to store the persistent state regularly
+func (rf *Raft) statePersistTicker() {
+	for !rf.killed() {
+		//save states
+		time.Sleep(StatePersistPeriod)
 	}
 }
 
@@ -507,13 +575,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.nPeer = len(peers)
+	rf.applyCh = applyCh
 	// Your initialization code here (2A, 2B, 2C).
 	rf.init()
 	// initialize from state persisted before a crash
-	rf.toFollower(&rf.mu)
+	rf.toCandidate(&rf.mu)
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	// go rf.statePersistTicker() //activate in 2C
 	return rf
 }

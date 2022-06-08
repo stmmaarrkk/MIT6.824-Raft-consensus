@@ -436,14 +436,12 @@ func (cfg *config) setlongreordering(longrel bool) {
 //
 func (cfg *config) checkOneLeader() int {
 	for iters := 0; iters < 10; iters++ {
-		DPrintf("[cfg.checkOneLeader]: the %v th try to check a leader", iters)
 		ms := 450 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		leaders := make(map[int][]int)
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
 				if term, leader := cfg.rafts[i].GetState(); leader {
-					DPrintf("[cfg.checkOneLeader]: Server %v claim it as leader", i)
 					leaders[term] = append(leaders[term], i)
 				}
 			}
