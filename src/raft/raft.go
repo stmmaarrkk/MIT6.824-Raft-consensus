@@ -37,8 +37,8 @@ const (
 
 const AppendEntriesInterval = 100
 const NonHeartbeatAEInterval = 3 //one non-heartbeat AppendEntries req will be sent once each NonHeartbeatAEFreq heart beat entries.
-const ElectionTimeoutLB = 5 * AppendEntriesInterval
-const ElectionTimeoutUB = 6 * AppendEntriesInterval
+const ElectionTimeoutLB = 4 * AppendEntriesInterval
+const ElectionTimeoutUB = 5 * AppendEntriesInterval
 const CommandBufferCap = 100
 const StatePersistPeriod = 100 //period(in ms) of saving state to disk
 
@@ -115,6 +115,9 @@ type Raft struct {
 	matchIndex       []int
 	aERound          int
 	commitIdxChanged bool
+
+	/**/
+	nextElectionTerm int
 
 	/*for debug*/
 	timeoutCount int
@@ -371,7 +374,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.initRVReply(reply)
 	if rf.verifyVoteReq(args, reply) {
 		rf.toFollower(nil)
-		rf.setCurrentTerm(args.Term) //important to have this
+		//Do not update term here, or there will be a infinite election
 		rf.setVotedFor(args.CandidateId)
 		rf.logPrintf("vote for %v", args.CandidateId)
 		reply.VoteGranted = true
@@ -380,20 +383,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 //The election process is not preemptible(guaranteed by lock in last level)
 func (rf *Raft) startElection() {
-	rf.currentTerm++    //increase the term
+	rf.currentTerm = rf.nextElectionTerm
+	elecTerm := rf.nextElectionTerm
+	rf.nextElectionTerm++
 	rf.votedFor = rf.me //vote for itself
-	elecTerm := rf.currentTerm
-	voteCh := make(chan bool)
+	voteCh := make(chan RequestVoteReply)
 
 	rf.logPrintf("Election for term %v begins", rf.currentTerm)
 	rf.sendRequestVoteToAll(elecTerm, voteCh)
 	rf.handleVoteResult(elecTerm, voteCh)
 }
 
-func (rf *Raft) sendRequestVoteToAll(elecTerm int, voteCh chan bool) {
+func (rf *Raft) sendRequestVoteToAll(elecTerm int, voteCh chan RequestVoteReply) {
 	for i := 0; i < rf.nPeer; i++ {
 		if i != rf.me {
-			go func(peerId int, voteCh chan bool) {
+			go func(peerId int, voteCh chan RequestVoteReply) {
 				rf.dPrintf("rf.startElection", "send vote to %v", peerId)
 
 				latestLogTerm := -1
@@ -414,25 +418,30 @@ func (rf *Raft) sendRequestVoteToAll(elecTerm int, voteCh chan bool) {
 					rf.logPrintf("Server %v fail to send vote request to %v\n for election of term %v ", rf.me, peerId, rf.currentTerm)
 				}
 
-				voteCh <- reply.VoteGranted
+				voteCh <- reply
 			}(i, voteCh)
 		}
 	}
 }
 
-func (rf *Raft) handleVoteResult(elecTerm int, voteCh chan bool) {
+func (rf *Raft) handleVoteResult(elecTerm int, voteCh chan RequestVoteReply) {
 	nVote := 1  //including candidate
 	nAgree := 1 //including candidate
 	for vote := range voteCh {
-		nVote++
-		if vote {
-			nAgree++
-		}
-
-		if elecTerm != rf.currentTerm {
-			rf.dPrintf("rf.startElection", "quit election due to unmatched term(cur:%v, elec:%v)", rf.currentTerm, elecTerm)
+		if rf.status != Candidate {
 			break
 		}
+
+		nVote++
+		if vote.VoteGranted {
+			nAgree++
+		}
+		rf.nextElectionTerm = Max(rf.nextElectionTerm, vote.Term+1) //update the next election term
+
+		// if elecTerm != rf.currentTerm {
+		// 	rf.dPrintf("rf.startElection", "quit election due to unmatched term(cur:%v, elec:%v)", rf.currentTerm, elecTerm)
+		// 	break
+		// }
 		rf.dPrintf("rf.startElection", "vote result: %v, summary: %v/%v/%v(agreed/collected/total)", vote, nAgree, nVote, rf.nPeer)
 		if nAgree > rf.nPeer/2 {
 			rf.dPrintf("rf.startElection", "Election for term %v end. Summary: %v/%v/%v(agreed/collected/total)", elecTerm, nAgree, nVote, rf.nPeer)
@@ -501,7 +510,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	if isLeader {
 		rf.appendLog(rf.createLog(command))
-		rf.logPrintf("Leader %v Received a command from client. cmd:%v, %v entries in log", rf.me, command, rf.log.size())
+		rf.logPrintf("Leader %v received a command from client. %v entries in the log", rf.me, rf.log.size())
 	}
 	return index, term, isLeader
 }

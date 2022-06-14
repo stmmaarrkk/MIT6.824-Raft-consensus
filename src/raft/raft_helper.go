@@ -37,7 +37,6 @@ func (rf *Raft) toLeader(elecTerm int, lock *sync.Mutex) bool {
 	if elecTerm != rf.currentTerm {
 		rf.dPrintf("rf.toLeader", "Fail to become a leader due to unmatched term")
 	} else {
-		rf.logPrintf("****** to leader status for term %v ******", rf.currentTerm)
 		rf.status = Leader
 		rf.isolated = false
 		rf.aERound = 0
@@ -57,6 +56,7 @@ func (rf *Raft) toLeader(elecTerm int, lock *sync.Mutex) bool {
 		rf.setVotedFor(rf.me)
 		rf.setTickerPeriod(rf.status)
 		success = true
+		rf.logPrintf("****** to leader status for term %v ******", rf.currentTerm)
 	}
 	return success
 }
@@ -66,11 +66,12 @@ func (rf *Raft) toCandidate(lock *sync.Mutex) {
 		lock.Lock()
 		defer lock.Unlock()
 	}
-	rf.logPrintf("++++++ to candidate status ++++++")
 	rf.status = Candidate
 	rf.isolated = true
+	rf.nextElectionTerm = rf.currentTerm + 1
 	rf.setVotedFor(-1)
 	rf.setTickerPeriod(rf.status)
+	rf.logPrintf("++++++ to candidate status ++++++")
 }
 
 func (rf *Raft) toFollower(lock *sync.Mutex) {
@@ -78,11 +79,11 @@ func (rf *Raft) toFollower(lock *sync.Mutex) {
 		lock.Lock()
 		defer lock.Unlock()
 	}
-	rf.logPrintf("------ to follower status -------")
 	rf.status = Follower
 	rf.isolated = true
 	rf.setVotedFor(-1)
 	rf.setTickerPeriod(rf.status)
+	rf.logPrintf("------ to follower status -------")
 }
 func (rf *Raft) verifyLeader(args *AppendEntriesArgs) bool {
 	result := true
