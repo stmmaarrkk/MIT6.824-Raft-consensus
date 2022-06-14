@@ -22,8 +22,9 @@ type Log struct {
 	mu             sync.Mutex
 	savedIdx       int //idx of the last lg that has been saved(is the valid idx of the entries not the unzipped one)
 	entries        []Entry
-	snapshotOffset int
+	snapshotOffset int //starts from 0
 	dirty          bool
+	tail           int //physical tail, point to the last entry
 }
 
 func makeLog(entries []Entry) Log {
@@ -32,6 +33,7 @@ func makeLog(entries []Entry) Log {
 	lg.entries = entries
 	lg.snapshotOffset = 0
 	lg.dirty = true
+	lg.tail = -1 //the physical index
 	return lg
 }
 
@@ -39,25 +41,25 @@ func makeLog(entries []Entry) Log {
 func (lg *Log) at(idx int) Entry {
 	lg.mu.Lock()
 	defer lg.mu.Unlock()
-	if idx < LogIndexOffset || idx >= lg.size()+LogIndexOffset {
+	if idx < LogIndexOffset || idx > lg.latestIdx() {
 		log.Panicf("Index %v is out of range of array with length=%v", idx, lg.size())
 	}
 
-	return lg.entries[idx-lg.snapshotOffset-LogIndexOffset]
+	return lg.entries[lg.toPIdx(idx)]
 }
 
-//
 func (lg *Log) set(idx int, val Entry) {
 	lg.mu.Lock()
 	defer lg.mu.Unlock()
-	if idx < LogIndexOffset || idx > lg.size()+LogIndexOffset { //start could be lg.size() + LogIndexOffset + 1, cuz it allows new entry to be appended
-		log.Panicf("index is %v, but it must be greater than 1 and no greater than %v", idx, lg.size()+LogIndexOffset)
+	if idx < LogIndexOffset || idx > lg.nextIdx() { //start could be lg.size() + LogIndexOffset + 1, cuz it allows new entry to be appended
+		log.Panicf("index is %v, but it must be greater than 1 and no greater than %v", idx, lg.nextIdx())
 	}
 
-	if idx == lg.size()+LogIndexOffset {
+	if idx == lg.nextIdx() {
 		lg.entries = append(lg.entries, val)
+		lg.tail++
 	} else {
-		lg.entries[idx-lg.snapshotOffset-LogIndexOffset] = val
+		lg.entries[lg.toPIdx(idx)] = val
 	}
 	lg.dirty = true
 }
@@ -83,6 +85,16 @@ func (lg *Log) getEntries(start int, end int) []Entry {
 	return entries
 }
 
+//CAREFUL!! DO NOT TRY TO MODIFY RETURN ENTRY
+func (lg *Log) getLatestEntry() *Entry {
+	var latestEntry Entry
+	//non empty log
+	if lg.nextIdx() != LogIndexOffset {
+		latestEntry = lg.at(lg.latestIdx())
+	}
+	return &latestEntry
+}
+
 //operating on logical index
 func (lg *Log) setEntries(start int, newEntries []Entry) {
 	for i := 0; i < len(newEntries); i++ {
@@ -90,19 +102,46 @@ func (lg *Log) setEntries(start int, newEntries []Entry) {
 	}
 }
 
+//entry after start(start is included) will be removed
+func (lg *Log) deleteAfter(start int) {
+	if start < LogIndexOffset {
+		log.Fatalf("delete start(%v) is too small", start)
+	}
+	if start <= lg.snapshotOffset {
+		log.Fatalf("log.deleteAfter has not been implement yet")
+	}
+	if start <= lg.latestIdx() {
+		lg.tail = start - 1
+	}
+}
+
+//convert physical idx to logical idx
+func (lg *Log) toLIdx(pIdx int) int {
+	return pIdx + lg.snapshotOffset + LogIndexOffset
+}
+
+//convert logical idx to physical idx
+func (lg *Log) toPIdx(lIdx int) int {
+	return lIdx - LogIndexOffset - lg.snapshotOffset
+}
+
 //The logical size
 func (lg *Log) size() int {
-	return len(lg.entries) + lg.snapshotOffset
+	return lg.latestIdx() - LogIndexOffset + 1
 }
 
 //The logical nextIdx
 func (lg *Log) nextIdx() int {
-	return lg.size() + LogIndexOffset
+	return lg.latestIdx() + 1
 }
 
 //The logical lastIdx
 func (lg *Log) latestIdx() int {
-	return lg.size() - 1 + LogIndexOffset
+	return lg.toLIdx(lg.tail)
+}
+
+func (lg *Log) isEmpty() bool {
+	return lg.size() > 0
 }
 
 func (lg *Log) encode(e *labgob.LabEncoder) *labgob.LabEncoder {
@@ -116,7 +155,7 @@ func (lg *Log) locateTermHead(term int) (int, bool) {
 	lg.mu.Lock()
 	defer lg.mu.Unlock()
 	loc, found := binarySearch(lg.entries, term)
-	return loc + lg.snapshotOffset + LogIndexOffset, found
+	return lg.toLIdx(loc), found
 }
 
 func (lg *Log) locateTermTail(term int) (int, bool) {
