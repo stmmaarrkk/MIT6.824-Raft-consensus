@@ -18,12 +18,13 @@ package raft
 //
 
 import (
-	//	"bytes"
-
+	"bytes"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -98,8 +99,8 @@ type Raft struct {
 
 	/*persistent states*/
 	currentTerm int
-	votedFor    int
-	log         Log //temporary type
+	votedFor    VoteRecord
+	log         *Log //temporary type
 
 	/*volatile states on all servers*/
 	status       PeerStatus
@@ -124,9 +125,11 @@ type Raft struct {
 }
 
 func (rf *Raft) init() {
-	rf.setCurrentTerm(0)
-	rf.setVotedFor(-1)
-	rf.log = makeLog(nil)
+	//initialize persistent state(do not use setter)
+	rf.log = makeLog()
+	rf.currentTerm = 0
+	rf.votedFor = VoteRecord{CandidateId: -1, ElecTerm: -1}
+
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.timeoutCount = 0 //for debug
@@ -144,60 +147,6 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-//getter and setter for persistent states
-func (rf *Raft) setCurrentTerm(currentTerm int) bool {
-	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
-	rf.currentTerm = currentTerm
-	return true //return false if there is an error
-}
-
-func (rf *Raft) setVotedFor(votedFor int) bool {
-	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
-	rf.votedFor = votedFor
-	return true //return false if there is an error
-}
-
-//set 1 entry, using logical index
-func (rf *Raft) setLog(idx int, log Entry) bool {
-	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
-	//remember to save to disk
-	rf.dPrintf("rf.setLog", "insert log to position %v ", idx)
-	rf.log.set(idx, log)
-	rf.log.deleteAfter(idx + 1)
-	rf.dPrintf("rf.setLogs", "the log: %v", rf.log.getEntries(1, rf.log.nextIdx()))
-
-	return true //return true if there is no error, for future use
-}
-
-//set entries, using logical index
-//will delete the entries after the inserted one
-func (rf *Raft) setLogs(start int, logs []Entry) bool {
-	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
-	//remember to save to disk
-	if len(logs) > 0 {
-		rf.dPrintf("rf.setLogs", "insert log with length of %v to position %v ", len(logs), start)
-		rf.log.setEntries(start, logs)
-		rf.log.deleteAfter(start + len(logs))
-		rf.dPrintf("rf.setLogs", "the log: %v", rf.log.getEntries(1, rf.log.nextIdx()))
-	}
-
-	return true //return true if there is no error, for future use
-}
-
-//append 1 entry, using logical index
-func (rf *Raft) appendLog(log Entry) bool {
-	return rf.setLog(rf.log.nextIdx(), log) //return true if there is no error, for future use
-}
-
-//append entries, using logical index
-func (rf *Raft) appendLogs(logs []Entry) bool {
-	return rf.setLogs(rf.log.nextIdx(), logs) //return true if there is no error, for future use
-}
-
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -205,13 +154,14 @@ func (rf *Raft) appendLogs(logs []Entry) bool {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	rf.log.encode(e)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	rf.dPrintf("rf.persist", "Encode current term=%v, votedFor=%v, log=%v", rf.currentTerm, rf.votedFor, rf.log.getAllEntries())
 }
 
 //
@@ -221,20 +171,16 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&rf.currentTerm) != nil || d.Decode(&rf.votedFor) != nil || rf.log.decode(d) != nil {
+		log.Panicf("Fail to load raft persistent state")
+	}
+	rf.nextElectionTerm = rf.currentTerm + 1
+
+	rf.logPrintf("Restore from term %v, votedFor:%v", rf.currentTerm, rf.votedFor)
+	rf.dPrintf("rf.readPersist", "restore with log(%v): %v", rf.log.size(), rf.log.entries)
 }
 
 //
@@ -255,236 +201,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
-}
-
-/*for append entry*/
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []Entry
-	LeaderCommit int
-	Key          int //used for checking if the AE reply debugging
-}
-type AppendEntriesReply struct {
-	Id      int
-	Term    int
-	Success bool
-	XTerm   int
-	XIndex  int
-	XLen    int
-}
-
-func (rf *Raft) sendAppendEntries() {
-	rf.aERound++
-	curRound := rf.aERound
-
-	//send non heartbeat entries
-	if rf.aERound%NonHeartbeatAEInterval == 0 {
-		rf.matchIndex[rf.me] = rf.log.latestIdx()
-		rf.dPrintf("rf.sendAppendEntries", "Sending Non-trivial AE reqs(%v)", curRound)
-	} else {
-		rf.dPrintf("rf.sendAppendEntries", "Sending Heartbeat AE reqs(%v)", curRound)
-	}
-
-	receiverList := rf.getAllPeers()
-
-	//update commit index takes time, only executed when necessary
-	if rf.commitIdxChanged {
-		rf.updateCommitIndex()
-	}
-
-	for r := range receiverList {
-		if r != rf.me {
-			go func(peerId int) {
-				args := rf.generateAEReq(peerId, curRound) //will generate heartbeat AE automatically
-				reply := AppendEntriesReply{}
-
-				//check if the request has been successfully sent
-				if rf.peers[peerId].Call("Raft.AppendEntries", &args, &reply) {
-					rf.handleAEReply(peerId, &args, &reply) //handle the reply
-				} else if rf.status == Leader {
-					rf.dPrintf("rf.sendAppendEntries", "fail to send AE(%v) to %v due to lost of connection", curRound, peerId)
-				}
-			}(r)
-		}
-	}
-	// rf.DPrintf("rf.sendAppendEntries", "%v of %v AE requests are approved", len(successReplies), rf.nPeer-1)
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	rf.dPrintf("rf.AppendEntries", "An AE request comes from server %v of term %v", args.LeaderId, args.Term)
-
-	rf.initAEReply(reply)
-	if rf.verifyLeader(args) {
-		// rf.dPrintf("rf.AppendEntries", "Timer", args.LeaderId)
-		rf.isolated = false
-		if rf.verifyAEReq(args, reply) { //will generate the reply if fail to verify this AE req
-			//the order of following part does matter!!
-			if rf.status != Follower { //If this server accept the AE request from other, means that other is more up-to-date
-				rf.toFollower(nil)
-			}
-
-			if args.Term > rf.currentTerm {
-				rf.setCurrentTerm(args.Term)
-			}
-			reply.Success = rf.setLogs(args.PrevLogIndex+1, args.Entries)
-			if args.LeaderCommit > rf.commitIndex {
-				rf.commitIndex = Min(args.LeaderCommit, rf.log.latestIdx())
-			}
-
-			rf.dPrintf("rf.AppendEntries", "%v entries are appended, %v entries in log", len(args.Entries), rf.log.size())
-		}
-	}
-
-	rf.mu.Unlock() //careful
-	rf.applyCommands()
-}
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// Your code here (2A, 2B).
-
-	rf.initRVReply(reply)
-	if rf.verifyVoteReq(args, reply) {
-		rf.toFollower(nil)
-		//Do not update term here, or there will be a infinite election
-		rf.setVotedFor(args.CandidateId)
-		rf.logPrintf("vote for %v", args.CandidateId)
-		reply.VoteGranted = true
-	}
-}
-
-//The election process is not preemptible(guaranteed by lock in last level)
-func (rf *Raft) startElection() {
-	rf.currentTerm = rf.nextElectionTerm
-	elecTerm := rf.nextElectionTerm
-	rf.nextElectionTerm++
-	rf.votedFor = rf.me //vote for itself
-	voteCh := make(chan RequestVoteReply)
-
-	rf.logPrintf("Election for term %v begins", rf.currentTerm)
-	rf.sendRequestVoteToAll(elecTerm, voteCh)
-	rf.handleVoteResult(elecTerm, voteCh)
-}
-
-func (rf *Raft) sendRequestVoteToAll(elecTerm int, voteCh chan RequestVoteReply) {
-	for i := 0; i < rf.nPeer; i++ {
-		if i != rf.me {
-			go func(peerId int, voteCh chan RequestVoteReply) {
-				rf.dPrintf("rf.startElection", "send vote to %v", peerId)
-
-				latestLogTerm := -1
-				if latestLog := rf.log.getLatestEntry(); latestLog != nil {
-					latestLogTerm = latestLog.Term
-				}
-
-				args := RequestVoteArgs{
-					Term:         elecTerm,
-					CandidateId:  rf.me,
-					LastLogIndex: rf.log.latestIdx(),
-					LastLogTerm:  latestLogTerm,
-				}
-
-				reply := RequestVoteReply{}
-
-				if !rf.sendRequestVote(peerId, &args, &reply) {
-					rf.logPrintf("Server %v fail to send vote request to %v\n for election of term %v ", rf.me, peerId, rf.currentTerm)
-				}
-
-				voteCh <- reply
-			}(i, voteCh)
-		}
-	}
-}
-
-func (rf *Raft) handleVoteResult(elecTerm int, voteCh chan RequestVoteReply) {
-	nVote := 1  //including candidate
-	nAgree := 1 //including candidate
-	for vote := range voteCh {
-		if rf.status != Candidate {
-			break
-		}
-
-		nVote++
-		if vote.VoteGranted {
-			nAgree++
-		}
-		rf.nextElectionTerm = Max(rf.nextElectionTerm, vote.Term+1) //update the next election term
-
-		// if elecTerm != rf.currentTerm {
-		// 	rf.dPrintf("rf.startElection", "quit election due to unmatched term(cur:%v, elec:%v)", rf.currentTerm, elecTerm)
-		// 	break
-		// }
-		rf.dPrintf("rf.startElection", "vote result: %v, summary: %v/%v/%v(agreed/collected/total)", vote, nAgree, nVote, rf.nPeer)
-		if nAgree > rf.nPeer/2 {
-			rf.dPrintf("rf.startElection", "Election for term %v end. Summary: %v/%v/%v(agreed/collected/total)", elecTerm, nAgree, nVote, rf.nPeer)
-			if rf.toLeader(elecTerm, &rf.mu) {
-				go rf.sendAppendEntries()
-			}
-			break
-		}
-	}
-}
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
 }
 
 //
@@ -509,7 +225,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := rf.status == Leader
 	// Your code here (2B).
 	if isLeader {
-		rf.appendLog(rf.createLog(command))
+		rf.appendLogs(rf.createLog(command))
 		rf.logPrintf("Leader %v received a command from client. %v entries in the log", rf.me, rf.log.size())
 	}
 	return index, term, isLeader
@@ -598,8 +314,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.init()
 	// initialize from state persisted before a crash
-	rf.toCandidate(&rf.mu)
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.toCandidate(&rf.mu)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

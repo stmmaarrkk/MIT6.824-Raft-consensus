@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"log"
 	"sync"
 
@@ -27,14 +28,17 @@ type Log struct {
 	tail           int //physical tail, point to the last entry
 }
 
-func makeLog(entries []Entry) Log {
-	lg := Log{}
+func (lg *Log) init() {
 	lg.savedIdx = -1
-	lg.entries = entries
+	lg.entries = make([]Entry, 0)
 	lg.snapshotOffset = 0
 	lg.dirty = true
 	lg.tail = -1 //the physical index
-	return lg
+}
+func makeLog() *Log {
+	lg := Log{}
+	lg.init()
+	return &lg
 }
 
 //access lg at certain logical index, return duplicated value
@@ -48,25 +52,13 @@ func (lg *Log) at(idx int) Entry {
 	return lg.entries[lg.toPIdx(idx)]
 }
 
-func (lg *Log) set(idx int, val Entry) {
-	lg.mu.Lock()
-	defer lg.mu.Unlock()
-	if idx < LogIndexOffset || idx > lg.nextIdx() { //start could be lg.size() + LogIndexOffset + 1, cuz it allows new entry to be appended
-		log.Panicf("index is %v, but it must be greater than 1 and no greater than %v", idx, lg.nextIdx())
-	}
-
-	if idx == lg.nextIdx() {
-		lg.entries = append(lg.entries, val)
-		lg.tail++
-	} else {
-		lg.entries[lg.toPIdx(idx)] = val
-	}
-	lg.dirty = true
+func (lg *Log) extend(entries ...Entry) *Log {
+	lg.setEntries(lg.nextIdx(), entries...)
+	return lg
 }
 
+//return the copy of the slice which contains the entries in between index [start, end)
 func (lg *Log) getEntries(start int, end int) []Entry {
-	lg.mu.Lock()
-	defer lg.mu.Unlock()
 	if start == end {
 		return make([]Entry, 0)
 	}
@@ -80,25 +72,50 @@ func (lg *Log) getEntries(start int, end int) []Entry {
 
 	//end is exclusive
 	entries := make([]Entry, end-start)
-	copy(entries, lg.entries[start-lg.snapshotOffset-LogIndexOffset:end-lg.snapshotOffset-LogIndexOffset])
+	if end > start {
+		copy(entries, lg.entries[lg.toPIdx(start):lg.toPIdx(end)])
+	}
 	// DPrintf("new entries in log:%v, from %v to %v", entries, start, end)
 	return entries
 }
 
+func (lg *Log) getAllEntries() []Entry {
+	return lg.getEntries(LogIndexOffset, lg.nextIdx())
+}
+
 //CAREFUL!! DO NOT TRY TO MODIFY RETURN ENTRY
-func (lg *Log) getLatestEntry() *Entry {
-	var latestEntry Entry
+func (lg *Log) getLatestEntry() (Entry, error) {
+
 	//non empty log
-	if lg.nextIdx() != LogIndexOffset {
-		latestEntry = lg.at(lg.latestIdx())
+	if !lg.isEmpty() {
+		return lg.at(lg.latestIdx()), nil
+	} else {
+		return Entry{}, errors.New("fail to retrieve latest entry due to empty log")
 	}
-	return &latestEntry
 }
 
 //operating on logical index
-func (lg *Log) setEntries(start int, newEntries []Entry) {
-	for i := 0; i < len(newEntries); i++ {
-		lg.set(start+i, newEntries[i])
+func (lg *Log) setEntries(start int, newEntries ...Entry) {
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
+
+	if start < LogIndexOffset || start > lg.nextIdx() { //start could be lg.size() + LogIndexOffset + 1, cuz it allows new entry to be appended
+		log.Panicf("The given start index is %v, but it must be greater than 1 and no greater than %v", start, lg.nextIdx())
+	}
+
+	for i, entry := range newEntries {
+		lIdx := start + i
+		pIdx := lg.toPIdx(lIdx)
+
+		if pIdx == len(lg.entries) {
+			lg.entries = append(lg.entries, Entry{})
+		} else if pIdx > len(lg.entries) {
+			log.Panicf("Unexpected error happens: pIdx=%v, the physical len of entries is %v", pIdx, len(lg.entries))
+		}
+
+		lg.tail = Max(pIdx, lg.tail)
+		lg.entries[pIdx] = entry
+		lg.dirty = true
 	}
 }
 
@@ -140,13 +157,61 @@ func (lg *Log) latestIdx() int {
 	return lg.toLIdx(lg.tail)
 }
 
+//return if logical log is empty or not
 func (lg *Log) isEmpty() bool {
-	return lg.size() > 0
+	return lg.size() == 0
 }
 
-func (lg *Log) encode(e *labgob.LabEncoder) *labgob.LabEncoder {
-	//TODO
-	return e
+func (lg *Log) encode(e *labgob.LabEncoder) error {
+	if err := e.Encode(lg.snapshotOffset); err != nil {
+		return err
+	}
+	if err := e.Encode(lg.tail); err != nil {
+		return err
+	}
+
+	DPrintf("encode snapshotOffset:%v, tail:%v", lg.snapshotOffset, lg.tail)
+
+	for _, entry := range lg.entries {
+		if err := e.Encode(entry.Term); err != nil {
+			return err
+		}
+		if err := e.Encode(entry.Command); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (lg *Log) decode(d *labgob.LabDecoder) error {
+	lg.init() //to the initial state
+	if err := d.Decode(&lg.snapshotOffset); err != nil {
+		return err
+	}
+
+	if err := d.Decode(&lg.tail); err != nil {
+		return err
+	}
+
+	DPrintf("decode snapshotOffset:%v, tail:%v", lg.snapshotOffset, lg.tail)
+
+	for i := 0; i <= lg.tail; i++ {
+		var entryTerm int
+		var entryCommand interface{}
+		if err := d.Decode(&entryTerm); err != nil {
+			log.Panic(err)
+			return err
+		}
+
+		if err := d.Decode(&entryCommand); err != nil {
+			log.Panic(err)
+			return err
+		}
+		DPrintf("decode entry: %v", Entry{Term: entryTerm, Command: entryCommand})
+		lg.extend(Entry{Term: entryTerm, Command: entryCommand})
+	}
+
+	return nil
 }
 
 //return the head index of the given term
