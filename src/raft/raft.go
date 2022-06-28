@@ -37,9 +37,9 @@ const (
 )
 
 const AppendEntriesInterval = 100
-const NonHeartbeatAEInterval = 3 //one non-heartbeat AppendEntries req will be sent once each NonHeartbeatAEFreq heart beat entries.
-const ElectionTimeoutLB = 4 * AppendEntriesInterval
-const ElectionTimeoutUB = 5 * AppendEntriesInterval
+const NonHeartbeatAEInterval = 1 //one non-heartbeat AppendEntries req will be sent once each NonHeartbeatAEFreq heart beat entries.
+const ElectionTimeoutLB = 5 * AppendEntriesInterval
+const ElectionTimeoutUB = 10 * AppendEntriesInterval
 const CommandBufferCap = 100
 const StatePersistPeriod = 100 //period(in ms) of saving state to disk
 
@@ -68,8 +68,6 @@ type ApplyMsg struct {
 
 //apply all commands that are committed
 func (rf *Raft) applyCommands() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
 		msg := ApplyMsg{
@@ -77,8 +75,8 @@ func (rf *Raft) applyCommands() {
 			Command:      rf.log.at(rf.lastApplied).Command,
 			CommandIndex: rf.lastApplied,
 		}
+		rf.logPrintf("Command(%v): {%v} has been committed", msg.CommandIndex, msg.Command)
 		rf.applyCh <- msg
-		rf.logPrintf("Command(%v) has been committed by peer %v", msg.CommandIndex, rf.me)
 	}
 }
 
@@ -99,7 +97,7 @@ type Raft struct {
 
 	/*persistent states*/
 	currentTerm int
-	votedFor    VoteRecord
+	votedFor    int
 	log         *Log //temporary type
 
 	/*volatile states on all servers*/
@@ -109,16 +107,17 @@ type Raft struct {
 	lastApplied  int
 	tickerPeriod time.Duration
 	nPeer        int
-	isolated     bool //true by default, will be set to false if receive hearbeat msg
+	// isolated     bool //true by default, will be set to false if receive hearbeat msg
 
 	/*volatile states on leader*/
-	nextIndex        []int
-	matchIndex       []int
-	aERound          int
-	commitIdxChanged bool
+	nextIndex         []int
+	matchIndex        []int
+	aERound           int
+	matchIndexChanged bool
 
-	/**/
+	/*helper*/
 	nextElectionTerm int
+	resetTimerCh     chan bool
 
 	/*for debug*/
 	timeoutCount int
@@ -128,11 +127,12 @@ func (rf *Raft) init() {
 	//initialize persistent state(do not use setter)
 	rf.log = makeLog()
 	rf.currentTerm = 0
-	rf.votedFor = VoteRecord{CandidateId: -1, ElecTerm: -1}
+	rf.votedFor = -1
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.timeoutCount = 0 //for debug
+	rf.timeoutCount = 0                   //for debug
+	rf.resetTimerCh = make(chan bool, 15) //must add capacity, or will be blocked
 }
 
 // return currentTerm and whether this server
@@ -161,7 +161,7 @@ func (rf *Raft) persist() {
 	rf.log.encode(e)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-	rf.dPrintf("rf.persist", "Encode current term=%v, votedFor=%v, log=%v", rf.currentTerm, rf.votedFor, rf.log.getAllEntries())
+	rf.dPrintf("rf.persist", "Save currentTerm=%v, votedFor=%v, len(log)%v", rf.currentTerm, rf.votedFor, rf.log.size())
 }
 
 //
@@ -179,8 +179,8 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	rf.nextElectionTerm = rf.currentTerm + 1
 
-	rf.logPrintf("Restore from term %v, votedFor:%v", rf.currentTerm, rf.votedFor)
-	rf.dPrintf("rf.readPersist", "restore with log(%v): %v", rf.log.size(), rf.log.entries)
+	rf.logPrintf("Restore from term %v, votedFor:%v, len(log):%v", rf.currentTerm, rf.votedFor, rf.log.size())
+	// rf.dPrintf("rf.readPersist", "restore with log(%v): %v", rf.log.size(), rf.log.entries)
 }
 
 //
@@ -226,7 +226,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	if isLeader {
 		rf.appendLogs(rf.createLog(command))
-		rf.logPrintf("Leader %v received a command from client. %v entries in the log", rf.me, rf.log.size())
+		rf.logPrintf("Leader %v appended a new command from client into its log. %v entries in the log", rf.me, rf.log.size())
 	}
 	return index, term, isLeader
 }
@@ -254,35 +254,63 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
+// func (rf *Raft) ticker(timerTerm int) {
+
+// 	for !rf.killed() && rf.timerTerm == timerTerm {
+// 		// Your code here to check if a leader election should
+// 		// be started and to randomize sleeping time using
+// 		// time.Sleep().
+
+// 		//randomize sleeping time
+// 		time.Sleep(rf.tickerPeriod)
+// 		rf.timeoutCount++
+// 		rf.dPrintf("rf.ticker", "ticker goes off(%v)", rf.timeoutCount)
+// 		switch rf.status {
+// 		case Leader:
+// 			go rf.sendAppendEntries() //may send heartbeat msg or real append entry req
+// 		case Candidate:
+// 				go rf.startElection()
+// 			} else {
+// 				rf.toFollower(&rf.mu)
+// 			}
+// 		case Follower:
+// 			if rf.isolated {
+// 				rf.toCandidate(&rf.mu)
+// 				go rf.startElection()
+// 			} else {
+// 				rf.isolated = true
+// 			}
+// 		}
+
+// 	}
+// }
+
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
-
-		//randomize sleeping time
-		time.Sleep(rf.tickerPeriod)
-		rf.timeoutCount++
-		rf.dPrintf("rf.ticker", "ticker goes off(%v)", rf.timeoutCount)
-		switch rf.status {
-		case Leader:
-			go rf.sendAppendEntries() //may send heartbeat msg or real append entry req
-		case Candidate:
-			if rf.isolated {
+		// On each iteration new timer is created
+		t := time.NewTimer(rf.tickerPeriod)
+		select {
+		case <-t.C:
+			rf.dPrintf("rf.ticker", "ticker fires(%v)", rf.timeoutCount)
+			switch rf.status {
+			case Leader:
+				go rf.sendAppendEntries() //may send heartbeat msg or real append entry req
+			case Candidate:
 				go rf.startElection()
-			} else {
-				rf.toFollower(&rf.mu)
-			}
-		case Follower:
-			if rf.isolated {
+			case Follower:
 				rf.toCandidate(&rf.mu)
 				go rf.startElection()
-			} else {
-				rf.isolated = true
+			}
+			rf.timeoutCount++
+
+		case <-rf.resetTimerCh: //Handle income message and move to the next iteration
+			rf.dPrintf("rf.ticker", "ticker reset(%v)", rf.timeoutCount)
+			if !t.Stop() {
+				<-t.C
 			}
 		}
-
 	}
+
 }
 
 //Implement logic to store the persistent state regularly
@@ -316,7 +344,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	rf.toCandidate(&rf.mu)
+	rf.toFollower(&rf.mu)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

@@ -4,11 +4,6 @@ import (
 	"fmt"
 )
 
-type VoteRecord struct {
-	CandidateId int
-	ElecTerm    int
-}
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -36,29 +31,33 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// Your code here (2A, 2B).
+	if rf.currentTerm < args.Term {
+		rf.toNewTerm(args.Term)
+		if rf.status != Follower {
+			rf.toFollower(nil)
+		}
+	}
 
 	rf.initRVReply(reply)
 	if rf.verifyVoteReq(args, reply) {
 		rf.logPrintf("vote for %v", args.CandidateId)
-		if rf.status != Follower {
-			rf.toFollower(nil)
-		}
-
-		//Do not update term here, or there will be a infinite election
-		rf.setVotedFor(VoteRecord{args.CandidateId, args.Term})
+		rf.setVotedFor(args.CandidateId)
 		reply.VoteGranted = true
+		rf.resetTimerCh <- true
 	}
 }
 
 //The election process is not preemptible(guaranteed by lock in last level)
 func (rf *Raft) startElection() {
-	rf.resetTerm(rf.nextElectionTerm)
-	elecTerm := rf.nextElectionTerm
-	rf.nextElectionTerm++
-	rf.setVotedFor(VoteRecord{rf.me, rf.currentTerm}) //vote for itself
+	rf.mu.Lock()
+	elecTerm := Max(rf.currentTerm+1, rf.nextElectionTerm)
+	rf.setCurrentTerm(elecTerm)
+	rf.setVotedFor(rf.me) //vote for itself
 	voteCh := make(chan RequestVoteReply)
+	rf.nextElectionTerm = elecTerm + 1
+	rf.mu.Unlock()
 
-	rf.logPrintf("Election for term %v begins", rf.currentTerm)
+	rf.logPrintf("Election for term %v begins", elecTerm)
 	rf.sendRequestVoteToAll(elecTerm, voteCh)
 	rf.handleVoteResult(elecTerm, voteCh)
 }
@@ -157,11 +156,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) hasVoted(elecTerm int) bool {
-	if rf.votedFor.CandidateId == -1 {
-		return false
-	} else {
-		return rf.votedFor.ElecTerm >= elecTerm
-	}
+	return rf.votedFor != -1
 }
 
 //vote for others when:
@@ -177,7 +172,7 @@ func (rf *Raft) verifyVoteReq(args *RequestVoteArgs, reply *RequestVoteReply) bo
 	if rf.hasVoted(args.Term) {
 		reason = "already voted for other candidate"
 		result = false
-	} else if rf.currentTerm >= args.Term {
+	} else if rf.currentTerm > args.Term {
 		reason = fmt.Sprintf("my term(%v) is greater than that of the candidate(%v)", rf.currentTerm, args.Term)
 		result = false
 	} else if myLatestLog, err := rf.log.getLatestEntry(); err == nil {

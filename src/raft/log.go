@@ -163,53 +163,30 @@ func (lg *Log) isEmpty() bool {
 }
 
 func (lg *Log) encode(e *labgob.LabEncoder) error {
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
 	if err := e.Encode(lg.snapshotOffset); err != nil {
 		return err
 	}
-	if err := e.Encode(lg.tail); err != nil {
+	if err := e.Encode(lg.entries); err != nil {
 		return err
 	}
 
-	DPrintf("encode snapshotOffset:%v, tail:%v", lg.snapshotOffset, lg.tail)
-
-	for _, entry := range lg.entries {
-		if err := e.Encode(entry.Term); err != nil {
-			return err
-		}
-		if err := e.Encode(entry.Command); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
 func (lg *Log) decode(d *labgob.LabDecoder) error {
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
 	lg.init() //to the initial state
 	if err := d.Decode(&lg.snapshotOffset); err != nil {
 		return err
 	}
 
-	if err := d.Decode(&lg.tail); err != nil {
+	if err := d.Decode(&lg.entries); err != nil {
 		return err
 	}
-
-	DPrintf("decode snapshotOffset:%v, tail:%v", lg.snapshotOffset, lg.tail)
-
-	for i := 0; i <= lg.tail; i++ {
-		var entryTerm int
-		var entryCommand interface{}
-		if err := d.Decode(&entryTerm); err != nil {
-			log.Panic(err)
-			return err
-		}
-
-		if err := d.Decode(&entryCommand); err != nil {
-			log.Panic(err)
-			return err
-		}
-		DPrintf("decode entry: %v", Entry{Term: entryTerm, Command: entryCommand})
-		lg.extend(Entry{Term: entryTerm, Command: entryCommand})
-	}
+	lg.tail = len(lg.entries) - 1
 
 	return nil
 }

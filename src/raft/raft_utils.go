@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"sort"
 	"sync"
 	"time"
 )
@@ -20,8 +19,8 @@ func (rf *Raft) setTickerPeriod(status PeerStatus) {
 }
 
 func (rf *Raft) getAllPeers() []int {
-	receiverList := make([]int, len(rf.peers))
-	for i := 0; i < len(rf.peers); i++ {
+	receiverList := make([]int, rf.nPeer)
+	for i := 0; i < rf.nPeer; i++ {
 		receiverList[i] = i
 	}
 
@@ -38,7 +37,6 @@ func (rf *Raft) toLeader(elecTerm int, lock *sync.Mutex) bool {
 		rf.dPrintf("rf.toLeader", "Fail to become a leader due to unmatched term")
 	} else {
 		rf.status = Leader
-		rf.isolated = false
 		rf.aERound = 0
 		rf.nextIndex = make([]int, rf.nPeer)
 		for i, _ := range rf.nextIndex {
@@ -53,6 +51,7 @@ func (rf *Raft) toLeader(elecTerm int, lock *sync.Mutex) bool {
 		rf.matchIndex = make([]int, rf.nPeer) //default value is 0
 		rf.matchIndex[rf.me] = rf.log.latestIdx()
 		rf.setTickerPeriod(rf.status)
+		rf.resetTimerCh <- true
 		success = true
 		rf.logPrintf("****** to leader status for term %v ******", rf.currentTerm)
 	}
@@ -65,9 +64,9 @@ func (rf *Raft) toCandidate(lock *sync.Mutex) {
 		defer lock.Unlock()
 	}
 	rf.status = Candidate
-	rf.isolated = true
 	rf.nextElectionTerm = rf.currentTerm + 1
 	rf.setTickerPeriod(rf.status)
+	rf.resetTimerCh <- true
 	rf.logPrintf("++++++ to candidate status ++++++")
 }
 
@@ -77,22 +76,9 @@ func (rf *Raft) toFollower(lock *sync.Mutex) {
 		defer lock.Unlock()
 	}
 	rf.status = Follower
-	rf.isolated = true
 	rf.setTickerPeriod(rf.status)
+	rf.resetTimerCh <- true
 	rf.logPrintf("------ to follower status -------")
-}
-
-func (rf *Raft) updateCommitIndex() {
-	old := rf.commitIndex
-	matchIdxes := make([]int, rf.nPeer)
-	copy(matchIdxes, rf.matchIndex)
-	sort.Ints(matchIdxes)
-	midIdx := rf.nPeer / 2
-	rf.commitIndex = Max(rf.commitIndex, matchIdxes[midIdx])
-	if old != rf.commitIndex {
-		rf.dPrintf("rf.updateCommitIndex", "commitIndex updated from %v to %v", old, rf.commitIndex)
-	}
-	rf.applyCommands()
 }
 
 func (rf *Raft) createLog(command interface{}) Entry {
@@ -102,9 +88,9 @@ func (rf *Raft) createLog(command interface{}) Entry {
 	}
 }
 
-func (rf *Raft) resetTerm(term int) {
+func (rf *Raft) toNewTerm(term int) {
 	rf.setCurrentTerm(term)
-	rf.setVotedFor(VoteRecord{CandidateId: -1, ElecTerm: rf.currentTerm})
+	rf.setVotedFor(-1)
 }
 
 //getter and setter for persistent states
@@ -116,7 +102,7 @@ func (rf *Raft) setCurrentTerm(currentTerm int) bool {
 	return true //return false if there is an error
 }
 
-func (rf *Raft) setVotedFor(votedFor VoteRecord) bool {
+func (rf *Raft) setVotedFor(votedFor int) bool {
 	rf.stateLock.Lock()
 	defer rf.stateLock.Unlock()
 	rf.votedFor = votedFor
@@ -140,8 +126,11 @@ func (rf *Raft) setLogs(start int, logs ...Entry) bool {
 	return true //return true if there is no error, for future use
 }
 
-//append entries, using logical index
+//append entries, using logical index, only called by leader
 func (rf *Raft) appendLogs(logs ...Entry) bool {
+	if rf.status != Leader {
+		log.Fatalf("In server %v: Only a leader can call rf.append", rf.me)
+	}
 	return rf.setLogs(rf.log.nextIdx(), logs...) //return true if there is no error, for future use
 }
 
@@ -149,13 +138,20 @@ func (rf *Raft) appendLogs(logs ...Entry) bool {
 func (rf *Raft) dPrintf(funcName string, str string, a ...interface{}) {
 	if !rf.killed() {
 		s := fmt.Sprintf(str, a...)
-		DPrintf("{%v-%v}[%v]: %v", statusToStr(rf.status), rf.me, funcName, s)
+		DPrintf("{%v-%v(%v)}[%v]: %v", statusToStr(rf.status), rf.me, rf.currentTerm, funcName, s)
 	}
 }
 
 func (rf *Raft) logPrintf(str string, a ...interface{}) {
 	if !rf.killed() {
 		s := fmt.Sprintf(str, a...)
-		log.Printf("{%v-%v}: %v", statusToStr(rf.status), rf.me, s)
+		log.Printf("{%v-%v(%v)}: %v", statusToStr(rf.status), rf.me, rf.currentTerm, s)
+	}
+}
+
+func (rf *Raft) logFatalf(str string, a ...interface{}) {
+	if !rf.killed() {
+		s := fmt.Sprintf(str, a...)
+		log.Fatalf("{%v-%v(%v)}: %v", statusToStr(rf.status), rf.me, rf.currentTerm, s)
 	}
 }
